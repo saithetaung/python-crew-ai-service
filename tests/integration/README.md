@@ -1,0 +1,1 @@
+Test with disposable Redis and non-production AWS resources. Cover TTL refresh, max-pair trimming, lock timeout, Bedrock tool-use message format, Spring Boot tool failures, and cross-user isolation. Never run integration tests against production crew records.

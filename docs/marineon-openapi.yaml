@@ -1,0 +1,457 @@
+openapi: 3.1.0
+info:
+  title: MarineOn AI Service API
+  version: 1.0.0
+  description: 'Internal API contract between the Ship Crew Management System Spring Boot backend and
+    the MarineOn FastAPI AI service. Spring Boot remains responsible for user authentication, authorization,
+    and business data access. FastAPI manages Bedrock Knowledge Base requests and Redis-backed conversation
+    sessions.
+
+
+    Error contract: clients should branch on HTTP status and errorCode, not detail text. Retry only when
+    retryable is true and the operation is safe; use bounded exponential backoff with jitter and honor
+    Retry-After. requestId is for correlation, not an idempotency key. Until server-side idempotency/deduplication
+    is implemented, Java must not blindly retry a chat POST after an ambiguous timeout because the first
+    request may already have reached Bedrock. Do not expose this internal endpoint directly to browsers.
+    Keep user/tenant identity trusted and scoped to each conversation.'
+servers:
+- url: http://127.0.0.1:8000
+  description: Local development
+tags:
+- name: chat
+  description: Grounded AI chat using the Bedrock Knowledge Base
+- name: health
+  description: Service health checks
+paths:
+  /internal/v1/chat:
+    post:
+      tags:
+      - chat
+      operationId: createChatResponse
+      summary: Ask MarineOn a question
+      description: 'Submit a question for retrieval-augmented generation. Reuse the same conversationId
+        for follow-up messages in the same conversation. The client must not supply a Bedrock sessionId;
+        FastAPI stores and reuses it internally in Redis. userId and tenantId must be derived from trusted
+        identity and authorization context in Spring Boot, not accepted blindly from an untrusted browser
+        request.
+
+
+        Error handling notes: the status codes describe the target contract. The FastAPI implementation
+        must explicitly map provider errors and install exception handlers where necessary; OpenAPI documentation
+        alone does not make the runtime emit these responses. Error responses use detail for backward
+        compatibility and may include errorCode, requestId, retryable, and details.'
+      security:
+      - InternalServiceToken: []
+      parameters: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              pr08Question:
+                summary: Question about PR-08
+                value:
+                  requestId: req-20261012-0001
+                  conversationId: conv-10025
+                  message: What are the recruitment requirements in PR-08?
+                  actor:
+                    userId: user-123
+                    tenantId: tenant-01
+      responses:
+        '200':
+          description: Answer generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+              examples:
+                success:
+                  value:
+                    requestId: req-20261012-0001
+                    conversationId: conv-10025
+                    status: completed
+                    answer: I couldn't find enough information about that in the available documents.
+                    citations: []
+                    latencySeconds: 8.123
+        '400':
+          description: The request is syntactically valid but cannot be processed because of invalid request
+            semantics, such as an invalid conversation state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: The request cannot be processed.
+                errorCode: INVALID_REQUEST
+                requestId: req-20261012-0001
+                retryable: false
+        '401':
+          description: Missing or invalid internal service token. Use errorCode=UNAUTHENTICATED when normalized
+            error handling is implemented.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: Invalid service credentials
+                errorCode: UNAUTHENTICATED
+                requestId: req-20261012-0001
+                retryable: false
+        '403':
+          description: The internal caller is authenticated, but the supplied actor or tenant context
+            is not authorized for this operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: The caller is not authorized for this conversation.
+                errorCode: FORBIDDEN
+                requestId: req-20261012-0001
+                retryable: false
+        '409':
+          description: Conversation is currently busy; retry shortly. Java may retry after a short delay
+            with a bounded retry policy; do not run concurrent turns for the same conversation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: This conversation is busy; retry shortly.
+                errorCode: CONVERSATION_BUSY
+                requestId: req-20261012-0001
+                retryable: true
+        '413':
+          description: Message exceeds the configured maximum length. Enforce request-size limits at the
+            proxy and application layers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: Message is too long
+                errorCode: MESSAGE_TOO_LARGE
+                requestId: req-20261012-0001
+                retryable: false
+        '415':
+          description: The request Content-Type is not supported. Send application/json.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: Unsupported media type. Use application/json.
+                errorCode: UNSUPPORTED_MEDIA_TYPE
+                requestId: req-20261012-0001
+                retryable: false
+        '422':
+          description: Request body failed validation. Validation errors should not be retried without
+            correcting the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationErrorResponse'
+        '429':
+          description: The caller or upstream model service is rate-limited. Respect Retry-After when
+            provided and use bounded exponential backoff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: Too many requests. Retry after the indicated delay.
+                errorCode: RATE_LIMITED
+                requestId: req-20261012-0001
+                retryable: true
+          headers:
+            Retry-After:
+              description: Suggested number of seconds before retrying.
+              schema:
+                type: integer
+                minimum: 1
+              example: 5
+        '500':
+          description: Unexpected AI service error. Do not expose stack traces, prompts, credentials,
+            or raw provider internals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: The AI service encountered an unexpected error.
+                errorCode: INTERNAL_ERROR
+                requestId: req-20261012-0001
+                retryable: false
+        '502':
+          description: Bedrock or another upstream dependency returned an invalid response or an upstream
+            failure that could not be handled as a temporary unavailable condition.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: The AI provider returned an upstream error.
+                errorCode: UPSTREAM_PROVIDER_ERROR
+                requestId: req-20261012-0001
+                retryable: true
+          headers:
+            Retry-After:
+              description: Suggested number of seconds before retrying.
+              schema:
+                type: integer
+                minimum: 1
+              example: 5
+        '503':
+          description: AI service, Bedrock, Redis, or service authentication configuration is unavailable.
+            Retry only with bounded exponential backoff and jitter when the operation is safe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: AI service is not ready
+                errorCode: SERVICE_UNAVAILABLE
+                requestId: req-20261012-0001
+                retryable: true
+        '504':
+          description: The AI service timed out while waiting for Bedrock or another required upstream
+            dependency.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastAPIError'
+              example:
+                detail: The AI provider did not respond before the timeout.
+                errorCode: UPSTREAM_TIMEOUT
+                requestId: req-20261012-0001
+                retryable: true
+          headers:
+            Retry-After:
+              description: Suggested number of seconds before retrying.
+              schema:
+                type: integer
+                minimum: 1
+              example: 5
+  /health/live:
+    get:
+      tags:
+      - health
+      operationId: getLiveness
+      summary: Check whether the API process is alive
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: alive
+  /health/ready:
+    get:
+      tags:
+      - health
+      operationId: getReadiness
+      summary: Check whether Redis is reachable and the service is ready
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ready
+        '503':
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: not_ready
+components:
+  securitySchemes:
+    InternalServiceToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Service-Token
+      description: Shared secret for local integration. Keep it server-side and configure it using a secret
+        manager or environment variable. For production, consider private networking and stronger service
+        identity such as workload IAM or mTLS.
+  schemas:
+    ChatRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - requestId
+      - conversationId
+      - message
+      - actor
+      properties:
+        requestId:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Unique identifier for this HTTP request, generated by Spring Boot.
+          example: req-20261012-0001
+        conversationId:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Application conversation identifier. Reuse for follow-up messages in this conversation.
+          example: conv-10025
+        message:
+          type: string
+          minLength: 1
+          maxLength: 8000
+          description: User's question. Whitespace-only messages are rejected.
+          example: What are the recruitment requirements in PR-08?
+        actor:
+          $ref: '#/components/schemas/ActorContext'
+    ActorContext:
+      type: object
+      additionalProperties: false
+      required:
+      - userId
+      - tenantId
+      properties:
+        userId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Authenticated user ID supplied by the trusted Spring Boot backend.
+          example: user-123
+        tenantId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Authorized tenant or organization ID supplied by Spring Boot.
+          example: tenant-01
+    ChatResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - requestId
+      - conversationId
+      - status
+      - answer
+      - citations
+      - latencySeconds
+      properties:
+        requestId:
+          type: string
+          description: Echoes the requestId from the request.
+        conversationId:
+          type: string
+          description: Echoes the conversationId from the request.
+        status:
+          type: string
+          const: completed
+          description: Indicates that the request completed and an answer payload was returned.
+        answer:
+          type: string
+          description: Generated answer grounded in retrieved Knowledge Base content.
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        latencySeconds:
+          type: number
+          format: float
+          minimum: 0
+          description: Server-measured duration of the Bedrock request, in seconds.
+    Citation:
+      type: object
+      properties:
+        text:
+          type: string
+          description: Text associated with the generated response citation, when available.
+        content:
+          type: string
+          description: Retrieved source content, when available.
+        location:
+          type: object
+          additionalProperties: true
+          description: Source location information returned by Bedrock, such as an S3 URI.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Source document metadata returned by Bedrock.
+        sourceName:
+          type: string
+          description: Display name for the source document.
+          default: Document
+    FastAPIError:
+      type: object
+      required:
+      - detail
+      properties:
+        detail:
+          description: Human-readable error message.
+          oneOf:
+          - type: string
+          - type: object
+          - type: array
+        errorCode:
+          type: string
+          description: Stable machine-readable error code for Java branching; do not parse detail text.
+          examples:
+          - INVALID_REQUEST
+          - FORBIDDEN
+          - RATE_LIMITED
+          - UPSTREAM_TIMEOUT
+        requestId:
+          type: string
+          description: Request correlation ID, when available.
+        retryable:
+          type: boolean
+          description: Whether a retry may be appropriate. Java must still use bounded retries and avoid
+            retrying unsafe duplicate POST operations blindly.
+        details:
+          description: Optional structured validation or diagnostic information safe to expose to the
+            internal caller.
+          oneOf:
+          - type: object
+            additionalProperties: true
+          - type: array
+            items:
+              type: object
+              additionalProperties: true
+      description: Error envelope. detail remains for compatibility with default FastAPI errors; normalized
+        error fields should be added by application exception handlers.
+    ValidationErrorResponse:
+      type: object
+      required:
+      - detail
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                  - type: string
+                  - type: integer
+              msg:
+                type: string
+              type:
+                type: string
+    HealthResponse:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - alive
+          - ready
+          - not_ready
