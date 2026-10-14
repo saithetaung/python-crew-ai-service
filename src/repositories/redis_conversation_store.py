@@ -14,8 +14,8 @@ class RedisConversationStore:
         self.lock_wait_seconds = lock_wait_seconds
 
     @staticmethod
-    def base_key(tenant_id: str, user_id: str, conversation_id: str) -> str:
-        return f"marineon:chat:{tenant_id}:{user_id}:{conversation_id}"
+    def base_key(user_id: str, conversation_id: str) -> str:
+        return f"marineon:chat:{user_id}:{conversation_id}"
 
     async def get_bedrock_session_id(self, key: str) -> str | None:
         return await self.redis.get(f"{key}:bedrock-session")

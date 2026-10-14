@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     chat_lock_wait_seconds: int = Field(default=5, ge=1, le=60)
     internal_api_token: SecretStr = SecretStr("")
     max_message_chars: int = Field(default=8000, ge=1, le=50000)
+    jwt_secret: SecretStr
+    jwt_issuer: str
+    jwt_audience: str
 
 
 @lru_cache
