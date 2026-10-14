@@ -3,36 +3,159 @@ import asyncio
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
-from src.tools.registry import (
-    BEDROCK_TOOL_CONFIG,
-    TOOL_NAMES,
-    execute_mock_tool,
-)
+import httpx
+
+from src.tools.registry import BEDROCK_TOOL_CONFIG, TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
 
 class BedrockToolError(Exception):
-    pass
+    """Raised when Bedrock tool execution fails."""
 
 
 class BedrockToolClient:
-    def __init__(self, client, model_id: str):
+    def __init__(
+        self,
+        client,
+        model_id: str,
+        java_api_base_url: str,
+        timeout_seconds: float = 30.0,
+    ):
         self.client = client
         self.model_id = model_id
+        self.java_api_base_url = java_api_base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+
+        parsed = urlparse(self.java_api_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("JAVA_API_BASE_URL is invalid")
+
+    @staticmethod
+    def _validate_days(arguments: dict[str, Any]) -> int:
+        days = arguments.get("days")
+
+        if (
+            isinstance(days, bool)
+            or not isinstance(days, int)
+            or days < 1
+        ):
+            raise ValueError("days must be a positive integer")
+
+        return days
+
+    async def _call_java(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        user_jwt: str,
+        request_id: str,
+    ) -> Any:
+        if tool_name == "get_expired_contracts":
+            path = "/api/dashboard/expired-contracts"
+            params = {"days": self._validate_days(arguments)}
+
+        elif tool_name == "get_expiring_certificates":
+            path = "/api/dashboard/expiring-certificates"
+            params = {"days": self._validate_days(arguments)}
+
+        elif tool_name == "list_vessels":
+            path = "/api/vessels"
+            params = None
+
+        else:
+            raise BedrockToolError("Unsupported business tool")
+
+        if not user_jwt:
+            raise BedrockToolError("User JWT is missing")
+
+        headers = {
+            "Authorization": f"Bearer {user_jwt}",
+            "Accept": "application/json",
+            "X-Request-ID": request_id,
+        }
+
+        url = f"{self.java_api_base_url}{path}"
+
+        logger.info(
+            "Calling Java API: tool=%s path=%s request_id=%s",
+            tool_name,
+            path,
+            request_id,
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds
+            ) as http:
+                response = await http.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                )
+
+            logger.info(
+                "Java API response: tool=%s status=%s request_id=%s",
+                tool_name,
+                response.status_code,
+                request_id,
+            )
+
+            response.raise_for_status()
+
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise BedrockToolError(
+                    "Java API returned invalid JSON"
+                ) from exc
+
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Java API returned HTTP %s for tool=%s request_id=%s",
+                exc.response.status_code,
+                tool_name,
+                request_id,
+            )
+            raise BedrockToolError(
+                f"Java API returned HTTP {exc.response.status_code}"
+            ) from exc
+
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Java API connection failed: tool=%s type=%s request_id=%s",
+                tool_name,
+                type(exc).__name__,
+                request_id,
+            )
+            raise BedrockToolError(
+                "Could not connect to Java API"
+            ) from exc
 
     async def ask(
         self,
         question: str,
         user_id: str,
         forced_tool_name: str | None = None,
+        auth_context: dict[str, Any] | None = None,
+        request_id: str = "",
     ) -> dict[str, Any]:
         if not self.model_id:
-            raise BedrockToolError("MODEL_ARN is not configured.")
+            raise BedrockToolError("MODEL_ARN is not configured")
 
         if forced_tool_name and forced_tool_name not in TOOL_NAMES:
-            raise BedrockToolError("Unknown requested tool.")
+            raise BedrockToolError("Unknown requested tool")
+
+        auth_context = auth_context or {}
+        user_jwt = auth_context.get("access_token")
+
+        if not isinstance(user_jwt, str) or not user_jwt:
+            raise BedrockToolError(
+                "Validated user JWT is unavailable"
+            )
 
         messages = [
             {
@@ -43,19 +166,17 @@ class BedrockToolClient:
 
         tool_calls = []
         start = time.perf_counter()
-
         tool_config = {"tools": BEDROCK_TOOL_CONFIG}
 
-        # Force the expected tool for deterministic integration testing.
         if forced_tool_name:
             tool_config["toolChoice"] = {
                 "tool": {"name": forced_tool_name}
             }
 
-        print(
-            f"[BEDROCK TOOL] Starting request; "
-            f"model={self.model_id}, forced_tool={forced_tool_name}",
-            flush=True,
+        logger.info(
+            "Starting Bedrock tool request: tool=%s request_id=%s",
+            forced_tool_name,
+            request_id,
         )
 
         try:
@@ -72,18 +193,6 @@ class BedrockToolClient:
                 )
 
                 message = response["output"]["message"]
-                stop_reason = response.get("stopReason")
-
-                print(
-                    f"[BEDROCK TOOL] step={step + 1}, "
-                    f"stopReason={stop_reason}",
-                    flush=True,
-                )
-                print(
-                    f"[BEDROCK TOOL] message={message}",
-                    flush=True,
-                )
-
                 messages.append(message)
 
                 tool_uses = [
@@ -99,17 +208,10 @@ class BedrockToolClient:
                         if "text" in block
                     ).strip()
 
-                    if not answer:
-                        answer = "The model returned no text answer."
-
-                    print(
-                        f"[BEDROCK TOOL] Final answer received; "
-                        f"tool_calls={tool_calls}",
-                        flush=True,
-                    )
-
                     return {
-                        "answer": answer,
+                        "answer": (
+                            answer or "The model returned no text answer."
+                        ),
                         "toolCalls": tool_calls,
                         "latency": time.perf_counter() - start,
                     }
@@ -121,74 +223,66 @@ class BedrockToolClient:
                     arguments = tool_use.get("input", {})
                     tool_use_id = tool_use.get("toolUseId")
 
-                    print(
-                        f"[BEDROCK TOOL] Requested tool={name}; "
-                        f"arguments={arguments}",
-                        flush=True,
-                    )
-
-                    if name not in TOOL_NAMES:
-                        result = {"error": "Unsupported tool."}
+                    if (
+                        not isinstance(arguments, dict)
+                        or name not in TOOL_NAMES
+                        or not tool_use_id
+                    ):
+                        result = {"error": "Invalid or unsupported tool call."}
                     else:
                         try:
-                            result = execute_mock_tool(
-                                name=name,
+                            result = await self._call_java(
+                                tool_name=name,
                                 arguments=arguments,
-                                user_id=user_id,
+                                user_jwt=user_jwt,
+                                request_id=request_id,
                             )
-                            print(
-                                f"[BEDROCK TOOL] Mock handler succeeded: "
-                                f"{name}",
-                                flush=True,
-                            )
-                        except (ValueError, TypeError, KeyError):
-                            logger.exception(
-                                "Mock tool failed: %s", name
+                        except (BedrockToolError, ValueError, TypeError):
+                            logger.warning(
+                                "Business tool failed: tool=%s request_id=%s",
+                                name,
+                                request_id,
                             )
                             result = {
                                 "error": (
-                                    "Invalid arguments or mock "
-                                    "tool execution failed."
+                                    "Business data could not be retrieved. "
+                                    "Please try again later."
                                 )
                             }
 
-                    tool_calls.append(
-                        {
-                            "name": name,
-                            "arguments": arguments,
+                    tool_calls.append({
+                        "name": name,
+                        "arguments": arguments,
+                    })
+
+                    tool_results.append({
+                        "toolResult": {
+                            "toolUseId": tool_use_id,
+                            "content": [{"json": result}],
                         }
-                    )
+                    })
 
-                    tool_results.append(
-                        {
-                            "toolResult": {
-                                "toolUseId": tool_use_id,
-                                "content": [{"json": result}],
-                            }
-                        }
-                    )
+                messages.append({
+                    "role": "user",
+                    "content": tool_results,
+                })
 
-                # Send tool results back to Bedrock.
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": tool_results,
-                    }
-                )
-
-                # After the initial forced tool call, let the model
-                # generate the final answer without forcing another tool.
+                # After a forced initial tool call, allow Bedrock
+                # to generate the final answer normally.
                 if step == 0 and forced_tool_name:
                     tool_config = {"tools": BEDROCK_TOOL_CONFIG}
 
             raise BedrockToolError(
-                "Tool calling exceeded the maximum number of steps."
+                "Tool calling exceeded the maximum number of steps"
             )
 
         except BedrockToolError:
             raise
         except Exception as exc:
-            logger.exception("Bedrock Converse tool request failed")
+            logger.exception(
+                "Bedrock Converse tool request failed; request_id=%s",
+                request_id,
+            )
             raise BedrockToolError(
-                "Bedrock tool calling failed."
+                "Bedrock tool calling failed"
             ) from exc

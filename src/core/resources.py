@@ -74,6 +74,7 @@ class Resources:
         self.tool_client = BedrockToolClient(
             client=self.bedrock_runtime_client,
             model_id=self.settings.model_arn,
+            java_api_base_url=self.settings.java_api_base_url,
         )
 
         self.chat_service = ChatService(

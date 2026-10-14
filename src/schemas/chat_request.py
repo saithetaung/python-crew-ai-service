@@ -1,22 +1,27 @@
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class ActorContext(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
-    user_id: str = Field(min_length=1, max_length=128, alias="userId")
-    tenant_id: str = Field(min_length=1, max_length=128, alias="tenantId")
-
-
 class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
-    request_id: str = Field(min_length=8, max_length=128, alias="requestId")
-    conversation_id: str = Field(min_length=8, max_length=128, alias="conversationId")
-    message: str = Field(min_length=1, max_length=8000)
-    actor: ActorContext
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="forbid",
+    )
 
-    @field_validator("message")
+    request_id: str = Field(alias="requestId", min_length=1, max_length=128)
+    conversation_id: str = Field(
+        alias="conversationId",
+        min_length=1,
+        max_length=256,
+    )
+    message: str = Field(min_length=1)
+
+    @field_validator("request_id", "conversation_id", "message")
     @classmethod
-    def non_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("message must not be blank")
-        return value.strip()
+    def reject_blank_values(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Value must not be blank")
+
+        return value

@@ -8,9 +8,7 @@ from src.providers.bedrock_rag_client import (
     BedrockRagError,
     extract_citations,
 )
-from src.providers.bedrock_tool_client import (
-    BedrockToolError,
-)
+from src.providers.bedrock_tool_client import BedrockToolError
 from src.schemas.chat_response import ChatResponse, Citation
 
 logger = logging.getLogger(__name__)
@@ -30,6 +28,7 @@ class ChatService:
         self.rag = rag
         self.tool_client = tool_client
 
+    
     @staticmethod
     def _select_business_tool(message: str) -> str | None:
         text = message.casefold()
@@ -37,55 +36,70 @@ class ChatService:
         asks_certificate = bool(
             re.search(r"\b(certificates?|certifications?)\b", text)
         )
-        asks_vessel = bool(re.search(r"\bvessel\b", text))
-        asks_status = bool(
-            re.search(r"\b(status|statuses|valid|expired)\b", text)
+        asks_vessel = bool(
+            re.search(r"\b(vessels?|ships?)\b", text)
         )
-        asks_crew = bool(re.search(r"\bcrew\b", text))
+        asks_contract = bool(
+            re.search(
+                r"\b(contracts?|employment agreements?)\b",
+                text,
+            )
+        )
         asks_expiry = bool(
-            re.search(r"\b(expir\w*|expiry|expiration|due)\b", text)
+            re.search(
+                r"\b(expir\w*|expiry|expiration|due|"
+                r"expiring|renewal|renewals)\b",
+                text,
+            )
         )
 
-        # Vessel certificate questions take priority.
-        if asks_certificate and asks_vessel and (
-            asks_status or asks_crew
-        ):
-            return "get_vessel_crew_certificate_status"
+        # Contract expiry: use the live Java dashboard API.
+        if asks_contract and asks_expiry:
+            return "get_expired_contracts"
 
-        # Current-vessel questions.
-        if re.search(
-            r"\b(current|my)\s+vessel\b|\bwhich vessel\b",
-            text,
-        ):
-            return "get_current_vessel"
-
-        # Certificate expiry questions, regardless of word order.
+        # Certificate expiry: use the live Java dashboard API.
         if asks_certificate and asks_expiry:
-            return "get_expiring_certifications"
+            return "get_expiring_certificates"
 
-        # Other vessel crew certificate status questions.
-        if asks_certificate and asks_vessel and asks_status:
-            return "get_vessel_crew_certificate_status"
+        # Vessel-specific certificate/status questions are not
+        # supported by the three current Java tools.
+        # Keep these on RAG until a suitable Java API is available.
+        if asks_vessel and asks_certificate:
+            return None
+
+        # General registered-vessel questions.
+        if asks_vessel:
+            return "list_vessels"
 
         return None
 
-    async def run(self, payload) -> ChatResponse:
+
+    async def run(self, payload, auth_context: dict) -> ChatResponse:
+        """
+        Process a chat request using identity from a validated JWT.
+
+        auth_context is supplied by require_user_jwt, not by the
+        request JSON body.
+        """
         if len(payload.message) > self.settings.max_message_chars:
             raise ChatServiceError(
                 "Message is too long",
                 status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
 
+        user_id = auth_context["user_id"]
+
+        # No tenant or actor fields are used.
+        # Update RedisConversationStore.base_key to accept these 2 arguments.
         key = self.store.base_key(
-            payload.actor.tenant_id,
-            payload.actor.user_id,
+            user_id,
             payload.conversation_id,
         )
 
-        print(
-            f"[CHAT] Received request={payload.request_id}; "
-            f"message={payload.message!r}",
-            flush=True,
+        logger.info(
+            "Chat request received; request_id=%s conversation_id=%s",
+            payload.request_id,
+            payload.conversation_id,
         )
 
         try:
@@ -95,27 +109,25 @@ class ChatService:
                     payload.message
                 )
 
-                print(
-                    f"[CHAT] Selected tool={selected_tool}",
-                    flush=True,
+                logger.info(
+                    "Chat routing selected; request_id=%s tool=%s",
+                    payload.request_id,
+                    selected_tool or "rag",
                 )
 
-                if (
-                    self.tool_client is not None
-                    and selected_tool is not None
-                ):
-                    print(
-                        f"[CHAT] Calling tool client: {selected_tool}",
-                        flush=True,
-                    )
-
+                if self.tool_client is not None and selected_tool is not None:
+                    # The authenticated identity comes from the validated JWT.
+                    # The tool client must not accept identity from the LLM.
                     result = await self.tool_client.ask(
                         question=payload.message,
-                        user_id=payload.actor.user_id,
+                        user_id=user_id,
                         forced_tool_name=selected_tool,
+                        auth_context=auth_context,
+                        request_id=payload.request_id,
                     )
 
                     answer = result.get("answer", "").strip()
+
                     if not answer:
                         answer = (
                             "The tool request completed, but no answer "
@@ -124,31 +136,31 @@ class ChatService:
 
                     latency = result["latency"]
 
-                    print(
-                        f"[CHAT] Tool flow completed; "
-                        f"tool_calls={result.get('toolCalls', [])}",
-                        flush=True,
+                    logger.info(
+                        "Tool flow completed; request_id=%s",
+                        payload.request_id,
                     )
 
                 else:
                     if selected_tool and self.tool_client is None:
-                        print(
-                            "[CHAT] WARNING: a business tool was selected "
-                            "but tool_client is not configured.",
-                            flush=True,
+                        logger.warning(
+                            "Business tool selected but tool client is "
+                            "not configured; request_id=%s",
+                            payload.request_id,
                         )
 
-                    print("[CHAT] Using existing RAG client", flush=True)
-
-                    session_id = (
-                        await self.store.get_bedrock_session_id(key)
+                    # Preserve the existing Bedrock RAG behavior.
+                    session_id = await self.store.get_bedrock_session_id(
+                        key
                     )
+
                     result = await self.rag.ask(
                         payload.message,
                         session_id=session_id,
                     )
 
                     raw = result["response"]
+
                     answer = (
                         raw.get("output", {}).get("text", "").strip()
                     )
@@ -160,6 +172,7 @@ class ChatService:
                         )
 
                     returned_session_id = raw.get("sessionId")
+
                     if returned_session_id:
                         await self.store.set_bedrock_session_id(
                             key,
@@ -170,8 +183,11 @@ class ChatService:
                         Citation(**item)
                         for item in extract_citations(raw)
                     ]
+
                     latency = result["latency"]
 
+                # Save only the completed user/assistant turn.
+                # Never save the JWT or auth_context in Redis.
                 await self.store.save_completed_turn(
                     key,
                     payload.message,
@@ -208,7 +224,7 @@ class ChatService:
                 payload.request_id,
             )
             raise ChatServiceError(
-                str(exc),
+                "The AI service could not retrieve an answer.",
                 503,
             ) from exc
 
