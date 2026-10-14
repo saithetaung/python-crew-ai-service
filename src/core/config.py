@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr
     jwt_issuer: str
     jwt_audience: str
+    java_api_base_url: str
 
 
 @lru_cache

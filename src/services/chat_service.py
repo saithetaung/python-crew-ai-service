@@ -28,6 +28,7 @@ class ChatService:
         self.rag = rag
         self.tool_client = tool_client
 
+    
     @staticmethod
     def _select_business_tool(message: str) -> str | None:
         text = message.casefold()
@@ -35,37 +36,43 @@ class ChatService:
         asks_certificate = bool(
             re.search(r"\b(certificates?|certifications?)\b", text)
         )
-        asks_vessel = bool(re.search(r"\bvessel\b", text))
-        asks_status = bool(
-            re.search(r"\b(status|statuses|valid|expired)\b", text)
+        asks_vessel = bool(
+            re.search(r"\b(vessels?|ships?)\b", text)
         )
-        asks_crew = bool(re.search(r"\bcrew\b", text))
+        asks_contract = bool(
+            re.search(
+                r"\b(contracts?|employment agreements?)\b",
+                text,
+            )
+        )
         asks_expiry = bool(
-            re.search(r"\b(expir\w*|expiry|expiration|due)\b", text)
+            re.search(
+                r"\b(expir\w*|expiry|expiration|due|"
+                r"expiring|renewal|renewals)\b",
+                text,
+            )
         )
 
-        # Vessel certificate questions take priority.
-        if asks_certificate and asks_vessel and (
-            asks_status or asks_crew
-        ):
-            return "get_vessel_crew_certificate_status"
+        # Contract expiry: use the live Java dashboard API.
+        if asks_contract and asks_expiry:
+            return "get_expired_contracts"
 
-        # Current-vessel questions.
-        if re.search(
-            r"\b(current|my)\s+vessel\b|\bwhich vessel\b",
-            text,
-        ):
-            return "get_current_vessel"
-
-        # Certificate expiry questions.
+        # Certificate expiry: use the live Java dashboard API.
         if asks_certificate and asks_expiry:
-            return "get_expiring_certifications"
+            return "get_expiring_certificates"
 
-        # Other vessel crew certificate status questions.
-        if asks_certificate and asks_vessel and asks_status:
-            return "get_vessel_crew_certificate_status"
+        # Vessel-specific certificate/status questions are not
+        # supported by the three current Java tools.
+        # Keep these on RAG until a suitable Java API is available.
+        if asks_vessel and asks_certificate:
+            return None
+
+        # General registered-vessel questions.
+        if asks_vessel:
+            return "list_vessels"
 
         return None
+
 
     async def run(self, payload, auth_context: dict) -> ChatResponse:
         """
@@ -116,6 +123,7 @@ class ChatService:
                         user_id=user_id,
                         forced_tool_name=selected_tool,
                         auth_context=auth_context,
+                        request_id=payload.request_id,
                     )
 
                     answer = result.get("answer", "").strip()

@@ -1,10 +1,13 @@
 
+import base64
 import logging
-from typing import Any
 
 import jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import HTTPException, Security, status
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 
 from src.core.config import get_settings
 
@@ -12,11 +15,11 @@ logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def require_user_jwt(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-) -> dict[str, Any]:
-    """Validate a local test JWT and extract trusted identity claims."""
-
+async def require_user_jwt(
+    credentials: HTTPAuthorizationCredentials | None = Security(
+        bearer_scheme
+    ),
+) -> dict:
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -25,19 +28,23 @@ def require_user_jwt(
         )
 
     settings = get_settings()
-    secret_setting = settings.jwt_secret
-    secret = (
-        secret_setting.get_secret_value()
-        if hasattr(secret_setting, "get_secret_value")
-        else str(secret_setting or "")
-    )
-    issuer = settings.jwt_issuer
-    audience = settings.jwt_audience
+    configured_secret = settings.jwt_secret.get_secret_value()
 
-    if not secret or not issuer or not audience:
+    if not configured_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="JWT authentication is not configured",
+            detail="JWT verification is not configured",
+        )
+
+    # Java: Decoders.BASE64.decode(jwtSecret)
+    # Python must decode the same Base64-encoded secret.
+    try:
+        signing_key = base64.b64decode(configured_secret)
+    except (ValueError, TypeError):
+        logger.error("Java JWT signing secret is not valid Base64")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="JWT verification configuration is invalid",
         )
 
     token = credentials.credentials
@@ -45,46 +52,55 @@ def require_user_jwt(
     try:
         claims = jwt.decode(
             token,
-            key=secret,
-            algorithms=["HS256"],
-            issuer=issuer,
-            audience=audience,
+            key=signing_key,
+            algorithms=["HS384"],
             options={
-                "require": [
-                    "sub", "name", "role", "iss", "aud", "iat", "exp"
-                ]
+                "require": ["sub", "id", "type", "iat", "exp"],
             },
         )
+
+        # Match Java's parserBuilder().require("type", "ACCESS").
+        if claims.get("type") != "ACCESS":
+            raise jwt.InvalidTokenError("Not an access token")
+
+        authorities = claims.get("authorities", [])
+        if not isinstance(authorities, list):
+            raise jwt.InvalidTokenError("Invalid authorities claim")
+
+        roles = []
+        for item in authorities:
+            if not isinstance(item, dict):
+                raise jwt.InvalidTokenError("Invalid authority entry")
+
+            authority = item.get("authority")
+            if not isinstance(authority, str):
+                raise jwt.InvalidTokenError("Invalid authority value")
+
+            roles.append(authority)
+
+        return {
+            "user_id": str(claims["id"]),
+            "username": claims["sub"],
+            "name": claims.get("fullName", ""),
+            "email": claims.get("email", ""),
+            "role": roles,
+            "access_token": token,
+        }
+
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Bearer token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid bearer token",
+            detail="JWT has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user_id = claims.get("sub")
-    name = claims.get("name")
-    role = claims.get("role")
-
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (user_id, name, role)
-    ):
+    except jwt.InvalidTokenError as exc:
+        logger.warning(
+            "Java JWT validation failed: error_type=%s",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="JWT is missing required identity claims",
+            detail="Invalid JWT",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-
-    # Keep the token in memory only. Never log or store it in Redis.
-    return {
-        "user_id": user_id,
-        "name": name,
-        "role": role,
-        "access_token": token,
-    }

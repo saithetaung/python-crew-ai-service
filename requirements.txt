@@ -8,3 +8,4 @@ pytest>=8.0
 pytest-asyncio>=0.24
 "botocore[crt]"
 PyJWT>=2.8,<3]
+httpx
