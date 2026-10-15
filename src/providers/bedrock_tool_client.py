@@ -100,7 +100,7 @@ class BedrockToolClient:
 
         elif tool_name == "list_vessels":
             path = "/api/vessels"
-            params = None
+            params = {"size": 1000}
 
         else:
             raise BedrockToolError("Unsupported business tool")
