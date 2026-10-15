@@ -1,12 +1,43 @@
+
 services:
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "no", "--maxmemory-policy", "volatile-lru"]
-    ports:
-      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - volatile-lru
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
-# Local development only. Use managed Redis/Valkey with TLS and authentication in production.
+    networks:
+      crew-network:
+        aliases:
+          - marineon-ai-redis
+
+  ai:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      crew-network:
+        aliases:
+          - marineon-ai
+
+networks:
+  crew-network:
+    driver: bridge

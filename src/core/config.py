@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_name: str = "MarineOn AI Service"
     log_level: str = "INFO"
-    aws_region: str = "ap-southeast-1"
+    aws_region: str = "ap-northeast-2"
     knowledge_base_id: str = ""
     model_arn: str = ""
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
