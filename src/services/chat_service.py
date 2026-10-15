@@ -28,7 +28,11 @@ class ChatService:
         self.rag = rag
         self.tool_client = tool_client
 
-    
+        logger.warning(
+            "[INIT] ChatService initialized | tool_client_available=%s",
+            self.tool_client is not None,
+        )
+
     @staticmethod
     def _select_business_tool(message: str) -> str | None:
         text = message.casefold()
@@ -53,34 +57,21 @@ class ChatService:
             )
         )
 
-        # Contract expiry: use the live Java dashboard API.
         if asks_contract and asks_expiry:
             return "get_expired_contracts"
 
-        # Certificate expiry: use the live Java dashboard API.
         if asks_certificate and asks_expiry:
             return "get_expiring_certificates"
 
-        # Vessel-specific certificate/status questions are not
-        # supported by the three current Java tools.
-        # Keep these on RAG until a suitable Java API is available.
         if asks_vessel and asks_certificate:
             return None
 
-        # General registered-vessel questions.
         if asks_vessel:
             return "list_vessels"
 
         return None
 
-
     async def run(self, payload, auth_context: dict) -> ChatResponse:
-        """
-        Process a chat request using identity from a validated JWT.
-
-        auth_context is supplied by require_user_jwt, not by the
-        request JSON body.
-        """
         if len(payload.message) > self.settings.max_message_chars:
             raise ChatServiceError(
                 "Message is too long",
@@ -89,35 +80,46 @@ class ChatService:
 
         user_id = auth_context["user_id"]
 
-        # No tenant or actor fields are used.
-        # Update RedisConversationStore.base_key to accept these 2 arguments.
         key = self.store.base_key(
             user_id,
             payload.conversation_id,
         )
 
-        logger.info(
-            "Chat request received; request_id=%s conversation_id=%s",
+        logger.warning(
+            "[FLOW 1] Chat request received | request_id=%s "
+            "conversation_id=%s user_id=%s",
             payload.request_id,
             payload.conversation_id,
+            user_id,
         )
 
         try:
             async with self.store.conversation_lock(key):
                 citations = []
+
                 selected_tool = self._select_business_tool(
                     payload.message
                 )
 
-                logger.info(
-                    "Chat routing selected; request_id=%s tool=%s",
+                logger.warning(
+                    "[FLOW 2] Routing decision | request_id=%s "
+                    "selected_tool=%s tool_client_available=%s",
                     payload.request_id,
-                    selected_tool or "rag",
+                    selected_tool or "RAG",
+                    self.tool_client is not None,
                 )
 
-                if self.tool_client is not None and selected_tool is not None:
-                    # The authenticated identity comes from the validated JWT.
-                    # The tool client must not accept identity from the LLM.
+                if (
+                    self.tool_client is not None
+                    and selected_tool is not None
+                ):
+                    logger.warning(
+                        "[FLOW 3] Starting business-tool workflow | "
+                        "request_id=%s tool=%s",
+                        payload.request_id,
+                        selected_tool,
+                    )
+
                     result = await self.tool_client.ask(
                         question=payload.message,
                         user_id=user_id,
@@ -136,20 +138,26 @@ class ChatService:
 
                     latency = result["latency"]
 
-                    logger.info(
-                        "Tool flow completed; request_id=%s",
+                    logger.warning(
+                        "[FLOW 9] Business-tool workflow completed | "
+                        "request_id=%s answer_chars=%s",
                         payload.request_id,
+                        len(answer),
                     )
 
                 else:
                     if selected_tool and self.tool_client is None:
-                        logger.warning(
-                            "Business tool selected but tool client is "
-                            "not configured; request_id=%s",
+                        logger.error(
+                            "[ROUTING ERROR] A business tool was selected, "
+                            "but tool_client is not configured | request_id=%s",
                             payload.request_id,
                         )
 
-                    # Preserve the existing Bedrock RAG behavior.
+                    logger.warning(
+                        "[FLOW 3] Starting RAG workflow | request_id=%s",
+                        payload.request_id,
+                    )
+
                     session_id = await self.store.get_bedrock_session_id(
                         key
                     )
@@ -186,12 +194,29 @@ class ChatService:
 
                     latency = result["latency"]
 
-                # Save only the completed user/assistant turn.
-                # Never save the JWT or auth_context in Redis.
+                    logger.warning(
+                        "[FLOW 9] RAG workflow completed | request_id=%s "
+                        "answer_chars=%s citation_count=%s",
+                        payload.request_id,
+                        len(answer),
+                        len(citations),
+                    )
+
+                logger.warning(
+                    "[FLOW 10] Saving completed conversation to Redis | "
+                    "request_id=%s",
+                    payload.request_id,
+                )
+
                 await self.store.save_completed_turn(
                     key,
                     payload.message,
                     answer,
+                )
+
+                logger.warning(
+                    "[FLOW 11] Preparing ChatResponse | request_id=%s",
+                    payload.request_id,
                 )
 
                 return ChatResponse(
@@ -203,14 +228,18 @@ class ChatService:
                 )
 
         except TimeoutError as exc:
+            logger.warning(
+                "Conversation lock timed out | request_id=%s",
+                payload.request_id,
+            )
             raise ChatServiceError(
                 "This conversation is busy; retry shortly.",
                 409,
             ) from exc
 
         except BedrockToolError as exc:
-            logger.warning(
-                "Bedrock tool request failed; request_id=%s",
+            logger.exception(
+                "Bedrock tool request failed | request_id=%s",
                 payload.request_id,
             )
             raise ChatServiceError(
@@ -219,8 +248,8 @@ class ChatService:
             ) from exc
 
         except BedrockRagError as exc:
-            logger.warning(
-                "Bedrock RAG request failed; request_id=%s",
+            logger.exception(
+                "Bedrock RAG request failed | request_id=%s",
                 payload.request_id,
             )
             raise ChatServiceError(
@@ -233,7 +262,7 @@ class ChatService:
 
         except Exception as exc:
             logger.exception(
-                "Unexpected chat failure; request_id=%s",
+                "Unexpected chat failure | request_id=%s",
                 payload.request_id,
             )
             raise ChatServiceError(
