@@ -1,6 +1,7 @@
-
 import asyncio
+import json
 import logging
+import os
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ class BedrockToolError(Exception):
 
 
 class BedrockToolClient:
+    MAX_TOOL_ROUNDS = 5
+
     def __init__(
         self,
         client,
@@ -45,6 +48,39 @@ class BedrockToolClient:
             raise ValueError("days must be a positive integer")
 
         return days
+
+    def _log_java_response(
+        self,
+        *,
+        tool_name: str,
+        request_id: str,
+        data: Any,
+    ) -> None:
+        """Log Java response metadata and optionally its raw JSON body."""
+        if (
+            os.getenv("LOG_JAVA_API_RESPONSE_BODY", "false").lower()
+            == "true"
+        ):
+            logger.warning(
+                "[FLOW 5] Java raw JSON response BEFORE Bedrock | "
+                "request_id=%s tool=%s\n%s",
+                request_id,
+                tool_name,
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            )
+        else:
+            logger.info(
+                "[FLOW 5] Java returned data | request_id=%s "
+                "tool=%s response_type=%s",
+                request_id,
+                tool_name,
+                type(data).__name__,
+            )
 
     async def _call_java(
         self,
@@ -75,21 +111,26 @@ class BedrockToolClient:
         headers = {
             "Authorization": f"Bearer {user_jwt}",
             "Accept": "application/json",
-            "X-Request-ID": request_id,
         }
+
+        if request_id:
+            headers["X-Request-ID"] = request_id
 
         url = f"{self.java_api_base_url}{path}"
 
         logger.info(
-            "Calling Java API: tool=%s path=%s request_id=%s",
+            "[FLOW 4a] Calling Java API | tool=%s path=%s request_id=%s",
             tool_name,
             path,
             request_id,
         )
 
+        started = time.perf_counter()
+
         try:
             async with httpx.AsyncClient(
-                timeout=self.timeout_seconds
+                timeout=self.timeout_seconds,
+                follow_redirects=False,
             ) as http:
                 response = await http.get(
                     url,
@@ -97,21 +138,42 @@ class BedrockToolClient:
                     headers=headers,
                 )
 
+            elapsed_ms = round(
+                (time.perf_counter() - started) * 1000,
+                2,
+            )
+
             logger.info(
-                "Java API response: tool=%s status=%s request_id=%s",
+                "[FLOW 4b] Java API response received | tool=%s "
+                "status=%s elapsed_ms=%s request_id=%s",
                 tool_name,
                 response.status_code,
+                elapsed_ms,
                 request_id,
             )
 
             response.raise_for_status()
 
             try:
-                return response.json()
+                data = response.json()
             except ValueError as exc:
                 raise BedrockToolError(
                     "Java API returned invalid JSON"
                 ) from exc
+
+            self._log_java_response(
+                tool_name=tool_name,
+                request_id=request_id,
+                data=data,
+            )
+
+            logger.info(
+                "[FLOW 6] Python received Java data | tool=%s request_id=%s",
+                tool_name,
+                request_id,
+            )
+
+            return data
 
         except httpx.HTTPStatusError as exc:
             logger.warning(
@@ -122,6 +184,16 @@ class BedrockToolClient:
             )
             raise BedrockToolError(
                 f"Java API returned HTTP {exc.response.status_code}"
+            ) from exc
+
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "Java API timed out | tool=%s request_id=%s",
+                tool_name,
+                request_id,
+            )
+            raise BedrockToolError(
+                "Java API request timed out"
             ) from exc
 
         except httpx.RequestError as exc:
@@ -166,21 +238,38 @@ class BedrockToolClient:
 
         tool_calls = []
         start = time.perf_counter()
-        tool_config = {"tools": BEDROCK_TOOL_CONFIG}
-
-        if forced_tool_name:
-            tool_config["toolChoice"] = {
-                "tool": {"name": forced_tool_name}
-            }
+        base_tool_config = {"tools": BEDROCK_TOOL_CONFIG}
 
         logger.info(
-            "Starting Bedrock tool request: tool=%s request_id=%s",
-            forced_tool_name,
+            "[FLOW 1] Starting Bedrock tool workflow | request_id=%s "
+            "user_id=%s forced_tool=%s",
             request_id,
+            user_id,
+            forced_tool_name or "automatic",
         )
 
         try:
-            for step in range(5):
+            for step in range(self.MAX_TOOL_ROUNDS):
+                # Force the selected tool only for the first request.
+                # Subsequent requests must be allowed to produce a final
+                # answer instead of repeatedly invoking the same tool.
+                tool_config = dict(base_tool_config)
+
+                if forced_tool_name and step == 0:
+                    tool_config["toolChoice"] = {
+                        "tool": {"name": forced_tool_name}
+                    }
+
+                logger.info(
+                    "[FLOW 2] Sending request to Bedrock Converse | "
+                    "request_id=%s round=%s message_count=%s "
+                    "tool_choice=%s",
+                    request_id,
+                    step + 1,
+                    len(messages),
+                    forced_tool_name if step == 0 else "automatic",
+                )
+
                 response = await asyncio.to_thread(
                     self.client.converse,
                     modelId=self.model_id,
@@ -192,28 +281,65 @@ class BedrockToolClient:
                     },
                 )
 
-                message = response["output"]["message"]
+                stop_reason = response.get("stopReason", "unknown")
+
+                logger.info(
+                    "[FLOW 3] Bedrock response received | "
+                    "request_id=%s round=%s stop_reason=%s",
+                    request_id,
+                    step + 1,
+                    stop_reason,
+                )
+
+                message = response.get("output", {}).get("message")
+
+                if not isinstance(message, dict):
+                    raise BedrockToolError(
+                        "Bedrock returned an invalid assistant message"
+                    )
+
                 messages.append(message)
 
                 tool_uses = [
                     block["toolUse"]
                     for block in message.get("content", [])
-                    if "toolUse" in block
+                    if isinstance(block, dict)
+                    and "toolUse" in block
                 ]
+
+                logger.info(
+                    "[FLOW 4] Bedrock tool requests | request_id=%s "
+                    "round=%s tools=%s",
+                    request_id,
+                    step + 1,
+                    [item.get("name") for item in tool_uses],
+                )
 
                 if not tool_uses:
                     answer = "\n".join(
                         block["text"]
                         for block in message.get("content", [])
-                        if "text" in block
+                        if isinstance(block, dict)
+                        and isinstance(block.get("text"), str)
                     ).strip()
 
+                    if not answer:
+                        answer = "The model returned no text answer."
+
+                    latency = time.perf_counter() - start
+
+                    logger.info(
+                        "[FLOW 8] Bedrock final answer received | "
+                        "request_id=%s answer_chars=%s latency_seconds=%.3f",
+                        request_id,
+                        len(answer),
+                        latency,
+                    )
+
                     return {
-                        "answer": (
-                            answer or "The model returned no text answer."
-                        ),
+                        "answer": answer,
                         "toolCalls": tool_calls,
-                        "latency": time.perf_counter() - start,
+                        "latency": latency,
                     }
 
                 tool_results = []
@@ -223,12 +349,25 @@ class BedrockToolClient:
                     arguments = tool_use.get("input", {})
                     tool_use_id = tool_use.get("toolUseId")
 
+                    logger.info(
+                        "[FLOW 4c] Processing tool request | request_id=%s "
+                        "tool=%s tool_use_id=%s",
+                        request_id,
+                        name,
+                        tool_use_id,
+                    )
+
                     if (
                         not isinstance(arguments, dict)
                         or name not in TOOL_NAMES
+                        or not isinstance(tool_use_id, str)
                         or not tool_use_id
                     ):
-                        result = {"error": "Invalid or unsupported tool call."}
+                        result = {
+                            "error": "Invalid or unsupported tool call."
+                        }
+                        result_status = "error"
+
                     else:
                         try:
                             result = await self._call_java(
@@ -237,40 +376,60 @@ class BedrockToolClient:
                                 user_jwt=user_jwt,
                                 request_id=request_id,
                             )
-                        except (BedrockToolError, ValueError, TypeError):
+                            result_status = "success"
+
+                        except (BedrockToolError, ValueError, TypeError) as exc:
                             logger.warning(
-                                "Business tool failed: tool=%s request_id=%s",
+                                "Business tool failed | tool=%s "
+                                "error_type=%s request_id=%s",
                                 name,
+                                type(exc).__name__,
                                 request_id,
                             )
+
                             result = {
                                 "error": (
                                     "Business data could not be retrieved. "
-                                    "Please try again later."
+                                    "Explain the failure to the user. "
+                                    "Do not repeat the same tool call."
                                 )
                             }
+                            result_status = "error"
 
                     tool_calls.append({
                         "name": name,
                         "arguments": arguments,
                     })
 
+                    # Converse toolResult content must contain a list of
+                    # content blocks. Preserve the matching toolUseId.
                     tool_results.append({
                         "toolResult": {
                             "toolUseId": tool_use_id,
-                            "content": [{"json": result}],
+                            "content": [{"json": {"result": result}}],
+                            "status": result_status,
                         }
                     })
+
+                logger.info(
+                    "[FLOW 7] Sending Java tool results to Bedrock | "
+                    "request_id=%s result_count=%s",
+                    request_id,
+                    len(tool_results),
+                )
 
                 messages.append({
                     "role": "user",
                     "content": tool_results,
                 })
 
-                # After a forced initial tool call, allow Bedrock
-                # to generate the final answer normally.
-                if step == 0 and forced_tool_name:
-                    tool_config = {"tools": BEDROCK_TOOL_CONFIG}
+            logger.error(
+                "Bedrock exceeded maximum tool rounds | request_id=%s "
+                "max_rounds=%s tool_calls=%s",
+                request_id,
+                self.MAX_TOOL_ROUNDS,
+                [call["name"] for call in tool_calls],
+            )
 
             raise BedrockToolError(
                 "Tool calling exceeded the maximum number of steps"
@@ -278,6 +437,7 @@ class BedrockToolClient:
 
         except BedrockToolError:
             raise
+
         except Exception as exc:
             logger.exception(
                 "Bedrock Converse tool request failed; request_id=%s",
